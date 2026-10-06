@@ -8,6 +8,7 @@
 - **字段校验**：未知物料类别、负/零重量、负污染量、单项或总污染量超过批次重量，一律拒绝判定并返回 `422` 字段错误
 - **规则版本化**：规则按 `(区域, 版本)` 存储，每区域一个启用版本，可新增版本、切换启用版本；判定单出具时保存**规则快照**，规则更新不会改写历史结论
 - **判定修订**：发现已出具单据的称重或杂质录入有误时，凭原单号 + 所见最新单号提交复检重量与物料，系统沿用原单批次、区域与规则快照复算，生成关联前版的只读新版本；完整修订链可按编号追溯
+- **判定复核**：质检员可对已出具的判定单选择同区域另一规则版本做只读复核：以原单保存的批次重量与物料明细按目标版本重新校验、计算，返回原结论与目标等级、扣费明细与差异项；不写单据、不产生修订与审计
 - **持久化与审计**：判定单、规则版本、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、规则新增/切换均留痕
 - **页面与 API**：简洁 Web 页面（`/`）+ REST API（交互文档 `/docs`）+ CSV 导出
 
@@ -53,6 +54,7 @@ pytest tests/ -q
 | GET | `/api/assessments/{id}` | 判定单详情（含扣费明细、证据与修订链信息） |
 | POST | `/api/assessments/{id}/revisions` | 修订判定单（沿用原单快照复算，生成新版本） |
 | GET | `/api/assessments/{id}/revisions` | 查询完整修订链与当前有效（链尾）结论 |
+| POST | `/api/assessments/{id}/review` | 复核判定单（按同区域目标规则版本重算对比，只读） |
 | GET | `/api/rules` | 列出全部规则版本 |
 | GET | `/api/rules/{region}/active` | 查询区域当前启用规则 |
 | POST | `/api/rules` | 新增规则版本（`activate: true` 可同时启用） |
@@ -213,6 +215,51 @@ curl -OJ http://localhost:8000/api/export/assessments.csv
 curl -OJ http://localhost:8000/api/export/audit.csv
 ```
 
+### 7. 复核判定单（换规则版本重算对比）
+
+质检员选择一张已出具的判定单与同区域一个已存在的规则版本，系统以原单保存的
+批次重量、物料明细按目标版本重新校验、计算，返回原结论与目标等级、扣费明细、
+差异项及双方规则版本。**复核只读**：不改变原单、修订链或审计记录。
+
+```bash
+# 假设原单号为 A0F9F9D8876（default 区域，出具时按 v1.0 判定）
+curl -X POST http://localhost:8000/api/assessments/A0F9F9D8876/review \
+  -H 'Content-Type: application/json' \
+  -d '{"rule_version": "v1.1"}'
+```
+
+响应 `200`（节选）：`original` 为原单结论，`review` 为按目标版本重算的结果，
+`diff` 为差异项（等级/结论是否变化、扣费差额、分类费率对比与中文说明）。
+
+```json
+{
+  "assessment_id": "A0F9F9D8876",
+  "batch_no": "B20261005-001",
+  "region": "default",
+  "weight_kg": 100,
+  "materials": [{"category": "PET", "contamination_kg": 3}],
+  "original": {"rule_version": "v1.0", "level": {"code": "B", "name": "轻度污染"},
+               "conclusion": "降级接收", "total_fee": 3.6},
+  "review": {"rule_version": "v1.1", "level": {"code": "B", "name": "轻度污染"},
+             "conclusion": "降级接收", "total_fee": 4.5},
+  "diff": {
+    "level_changed": false,
+    "conclusion_changed": false,
+    "total_fee_delta": 0.9,
+    "fee_line_diffs": [
+      {"category": "PET", "original_fee_per_kg": 1.2, "review_fee_per_kg": 1.5,
+       "original_fee": 3.6, "review_fee": 4.5, "delta": 0.9}
+    ],
+    "items": ["等级不变：B（轻度污染）。", "扣费合计 3.60 → 4.50 元（+0.90）。"]
+  }
+}
+```
+
+拒绝情形：判定单不存在（`404`）、目标规则版本不存在（`404`）、`region`
+与原单区域不一致（`422`）、原单缺少可重算的批次重量或物料明细（`422`）；
+目标版本重算仍执行现有重量、类别与污染量校验，不通过时返回 `422` 字段错误。
+以上失败与成功复核一样，均不产生任何单据、修订或审计记录。
+
 ## 规则版本化设计
 
 - 规则以 `(region, version)` 唯一存储，每个区域恰好一个 `active` 版本。
@@ -233,6 +280,18 @@ curl -OJ http://localhost:8000/api/export/audit.csv
   `parent_id` / `revision_reason`，既有字段含义不变；`GET /api/assessments/{id}/revisions`
   返回完整修订链与链尾（当前有效）结论。
 
+## 判定复核设计
+
+- 复核是**纯只读**的对比计算：读取原单保存的批次重量与物料明细，按同区域
+  目标规则版本重新执行与出具判定相同的校验与计算，不写任何表、不留审计。
+- 目标版本必须与原单同区域：请求可显式携带 `region`（缺省取原单区域），
+  与原单区域不一致直接 `422`；版本不存在 `404`。
+- 原单缺少可重算明细（历史遗留数据缺批次重量或物料明细）时 `422` 拒绝；
+  目标版本下类别不再受支持等校验失败同样 `422`，且无任何副作用。
+- 响应同时给出 `original`（原单结论）、`review`（目标版本重算结果，含证据）
+  与 `diff`（等级/结论变化标记、扣费总差额、分类费率与扣费对比、中文差异说明），
+  便于质检员直接核对规则调整对历史批次的影响。
+
 ## 项目结构
 
 ```
@@ -241,7 +300,7 @@ app/
   rules.py           # 规则引擎：种子规则、提交校验、判定计算
   storage.py         # SQLite 持久化：判定单（含修订链）/ 规则版本 / 审计日志
   static/index.html  # 单文件 Web 页面
-tests/test_api.py    # 30 个接口、版本化与修订行为测试
+tests/test_api.py    # 39 个接口、版本化、修订与复核行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

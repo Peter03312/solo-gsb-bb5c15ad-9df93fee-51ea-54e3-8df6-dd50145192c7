@@ -6,9 +6,13 @@ from app.storage import Store
 
 
 @pytest.fixture()
-def client(tmp_path):
+def store(tmp_path):
     """每个用例使用独立的临时数据库。"""
-    store = Store(str(tmp_path / "test.db"))
+    return Store(str(tmp_path / "test.db"))
+
+
+@pytest.fixture()
+def client(store):
     app.dependency_overrides[get_store] = lambda: store
     with TestClient(app) as c:
         yield c

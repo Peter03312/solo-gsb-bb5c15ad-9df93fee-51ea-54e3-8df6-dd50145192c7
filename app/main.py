@@ -63,6 +63,12 @@ class ActivateIn(BaseModel):
     actor: str | None = Field(default=None, max_length=32)
 
 
+class ReviewIn(BaseModel):
+    """复核请求：目标规则版本；region 缺省取原单区域，提供时须与原单一致。"""
+    rule_version: str = Field(min_length=1, max_length=32)
+    region: str | None = Field(default=None, max_length=32)
+
+
 # ------------------------------------------------------------------ 错误处理
 def _err(errors: list[dict], status: int = 422) -> JSONResponse:
     return JSONResponse(status_code=status, content={"errors": errors})
@@ -269,6 +275,70 @@ def list_revisions(aid: str, store: Store = Depends(get_store)):
     } for r in chain]
     return {"root_id": chain[0]["root_id"] or chain[0]["id"],
             "current_id": tail_id, "current": items[-1], "items": items}
+
+
+# ---------------------------------------------------------------- 复核接口
+@app.post("/api/assessments/{aid}/review")
+def review_assessment(aid: str, payload: ReviewIn,
+                      store: Store = Depends(get_store)):
+    """复核已出具的判定单：以原单保存的批次重量与物料明细，按同区域
+    目标规则版本重新校验、计算，返回原结论与目标等级、扣费明细及差异项。
+    只读操作：不写入单据、不产生修订、不记录审计。"""
+    rec = store.get_assessment(aid)
+    if not rec:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    region = payload.region or rec["region"]
+    if region != rec["region"]:
+        return _err([{"field": "region",
+                      "message": f"区域不一致：判定单属于区域 {rec['region']}，"
+                                 f"目标规则版本属于区域 {region}"}])
+    rule = store.get_rule(region, payload.rule_version)
+    if not rule:
+        return _err([{"field": "rule_version",
+                      "message": f"区域 {region} 不存在规则版本 "
+                                 f"{payload.rule_version}"}], 404)
+    weight = rec.get("weight_kg")
+    materials = rec.get("materials")
+    if weight is None or not materials:
+        return _err([{"field": "materials",
+                      "message": "原单缺少可重算明细（批次重量或物料明细缺失），"
+                                 "无法复核"}])
+    # 目标版本重算仍执行现有重量、类别与污染量校验
+    errors = engine.validate_submission(rule, weight, materials)
+    if errors:
+        return _err(errors)
+    result = engine.evaluate(rule, weight, materials)
+    original = {
+        "rule_version": rec["rule_version"],
+        "level": rec["level"],
+        "conclusion": rec["conclusion"],
+        "total_contamination_kg": rec["total_contamination_kg"],
+        "contamination_ratio": rec["contamination_ratio"],
+        "fee_lines": rec["fee_lines"],
+        "total_fee": rec["total_fee"],
+        "currency": rec["currency"],
+    }
+    review = {
+        "rule_version": rule["version"],
+        "level": result["level"],
+        "conclusion": result["conclusion"],
+        "total_contamination_kg": result["total_contamination_kg"],
+        "contamination_ratio": result["contamination_ratio"],
+        "fee_lines": result["fee_lines"],
+        "total_fee": result["total_fee"],
+        "currency": result["currency"],
+        "evidence": result["evidence"],
+    }
+    return {
+        "assessment_id": rec["id"],
+        "batch_no": rec["batch_no"],
+        "region": rec["region"],
+        "weight_kg": weight,
+        "materials": materials,
+        "original": original,
+        "review": review,
+        "diff": engine.diff_results(original, review),
+    }
 
 
 # ---------------------------------------------------------------- 审计与导出

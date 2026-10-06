@@ -464,3 +464,163 @@ def test_revision_list_and_csv_compatibility(client):
     assert header.startswith("﻿id,batch_no,region,weight_kg")
     assert "version" in header and "is_current" in header
     assert "revision_reason" in header
+
+
+# ------------------------------------------------------------------ 判定复核
+def test_review_ok_with_fee_diff(client):
+    # 原单：v1.0，PET 3kg/100kg → B 级，扣费 3.6
+    a1 = create_one(client)
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v1.1"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["assessment_id"] == a1["id"]
+    assert d["batch_no"] == a1["batch_no"]
+    assert d["region"] == "default"
+    assert d["weight_kg"] == 100
+    assert d["materials"] == [{"category": "PET", "contamination_kg": 3}]
+    # 原结论与目标版本结果分别返回
+    assert d["original"]["rule_version"] == "v1.0"
+    assert d["original"]["level"]["code"] == "B"
+    assert d["original"]["total_fee"] == 3.6
+    assert d["review"]["rule_version"] == "v1.1"
+    assert d["review"]["level"]["code"] == "B"        # 3% ≤ 5%，仍为 B
+    assert d["review"]["total_fee"] == 4.5            # 3kg × 1.5 × 1.0
+    assert any("default/v1.1" in e for e in d["review"]["evidence"])
+    # 差异项
+    diff = d["diff"]
+    assert diff["level_changed"] is False
+    assert diff["conclusion_changed"] is False
+    assert diff["total_fee_delta"] == 0.9
+    assert len(diff["fee_line_diffs"]) == 1
+    line = diff["fee_line_diffs"][0]
+    assert line["category"] == "PET"
+    assert line["original_fee_per_kg"] == 1.2
+    assert line["review_fee_per_kg"] == 1.5
+    assert line["original_fee"] == 3.6
+    assert line["review_fee"] == 4.5
+    assert line["delta"] == 0.9
+    assert any("扣费合计 3.60 → 4.50" in i for i in diff["items"])
+
+
+def test_review_level_and_conclusion_change(client):
+    # 1.8kg/100kg = 1.8%：v1.0 命中 A（≤2%），v1.1 命中 B（>1.5%）
+    a1 = create_one(client,
+                    materials=[{"category": "PET", "contamination_kg": 1.8}])
+    assert a1["level"]["code"] == "A"
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v1.1"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["original"]["conclusion"] == "合格接收"
+    assert d["review"]["level"]["code"] == "B"
+    assert d["review"]["conclusion"] == "降级接收"
+    diff = d["diff"]
+    assert diff["level_changed"] is True
+    assert diff["conclusion_changed"] is True
+    assert diff["total_fee_delta"] == 2.7          # 1.8 × 1.5 × 1.0
+    assert any("等级变化：A" in i and "→ B" in i for i in diff["items"])
+    assert any("合格接收 → 降级接收" in i for i in diff["items"])
+
+
+def test_review_same_version_no_diff(client):
+    a1 = create_one(client)
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v1.0"})
+    assert r.status_code == 200
+    diff = r.json()["diff"]
+    assert diff["level_changed"] is False
+    assert diff["conclusion_changed"] is False
+    assert diff["total_fee_delta"] == 0
+    assert diff["fee_line_diffs"] == []
+    assert "复核结果与原判定一致。" in diff["items"]
+
+
+def test_review_read_only_no_side_effects(client):
+    a1 = create_one(client)
+    before_audit = len(client.get("/api/audit").json()["items"])
+
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v1.1"})
+    assert r.status_code == 200
+
+    # 原单内容不变、修订链不增长、不产生审计记录
+    old = client.get(f"/api/assessments/{a1['id']}").json()
+    assert old["rule_version"] == "v1.0"
+    assert old["total_fee"] == 3.6
+    assert old["is_current"] is True
+    chain = client.get(f"/api/assessments/{a1['id']}/revisions").json()
+    assert len(chain["items"]) == 1
+    after_audit = client.get("/api/audit").json()["items"]
+    assert len(after_audit) == before_audit
+
+
+def test_review_assessment_not_found(client):
+    r = client.post("/api/assessments/NOPE/review",
+                    json={"rule_version": "v1.1"})
+    assert r.status_code == 404
+    assert "id" in fields(r)
+
+
+def test_review_rule_version_not_found(client):
+    a1 = create_one(client)
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v9.9"})
+    assert r.status_code == 404
+    assert "rule_version" in fields(r)
+
+
+def test_review_region_mismatch_rejected(client):
+    a1 = create_one(client)  # 属于 default 区域
+    # 目标版本在华东确实存在，但区域与原单不一致
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"region": "华东", "rule_version": "v1.0"})
+    assert r.status_code == 422
+    assert "region" in fields(r)
+    assert "区域不一致" in r.json()["errors"][0]["message"]
+
+
+def test_review_target_rule_validation_applies(client):
+    # 新增只含 PET 的 default/v2.0；原单含纸类，按 v2.0 重算应被类别校验拒绝
+    new_rule = {
+        "region": "default", "version": "v2.0",
+        "categories": {"PET": {"fee_per_kg": 2.0, "desc": "PET"}},
+        "levels": [{"code": "A", "name": "合格", "max_ratio": 1.0,
+                    "conclusion": "合格接收", "fee_multiplier": 0}],
+    }
+    assert client.post("/api/rules", json=new_rule).status_code == 201
+    a1 = create_one(client, materials=[{"category": "纸类",
+                                        "contamination_kg": 2}])
+    before_audit = len(client.get("/api/audit").json()["items"])
+
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v2.0"})
+    assert r.status_code == 422
+    assert "materials[0].category" in fields(r)
+    assert "未知物料类别" in r.json()["errors"][0]["message"]
+    # 校验失败同样只读：无新单据、无新审计
+    chain = client.get(f"/api/assessments/{a1['id']}/revisions").json()
+    assert len(chain["items"]) == 1
+    assert len(client.get("/api/audit").json()["items"]) == before_audit
+
+
+def test_review_missing_details_rejected(client, store):
+    import json as _json
+    import sqlite3
+
+    a1 = create_one(client)
+    # 模拟历史遗留数据：request_json 中缺少物料明细
+    conn = sqlite3.connect(store.path)
+    req = _json.loads(conn.execute(
+        "SELECT request_json FROM assessments WHERE id=?",
+        (a1["id"],)).fetchone()[0])
+    req.pop("materials")
+    conn.execute("UPDATE assessments SET request_json=? WHERE id=?",
+                 (_json.dumps(req, ensure_ascii=False), a1["id"]))
+    conn.commit()
+    conn.close()
+
+    r = client.post(f"/api/assessments/{a1['id']}/review",
+                    json={"rule_version": "v1.1"})
+    assert r.status_code == 422
+    assert "缺少可重算明细" in r.json()["errors"][0]["message"]

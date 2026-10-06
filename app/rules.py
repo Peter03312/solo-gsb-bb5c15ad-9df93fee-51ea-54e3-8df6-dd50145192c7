@@ -169,6 +169,79 @@ def evaluate(rule: dict, weight_kg: float, materials: list[dict]) -> dict:
     }
 
 
+def _by_category(lines: list[dict]) -> dict:
+    """扣费明细按类别聚合（同类别多行时合并污染量与扣费）。"""
+    agg: dict[str, dict] = {}
+    for line in lines:
+        cur = agg.setdefault(line["category"], {
+            "fee_per_kg": line["fee_per_kg"],
+            "multiplier": line["multiplier"],
+            "contamination_kg": 0.0,
+            "fee": 0.0,
+        })
+        cur["contamination_kg"] += line["contamination_kg"]
+        cur["fee"] = _money(cur["fee"] + line["fee"])
+    return agg
+
+
+def diff_results(original: dict, review: dict) -> dict:
+    """对比原判定结论与复核重算结果，输出结构化差异项与中文说明。
+
+    original / review 均需包含 level、conclusion、fee_lines、total_fee。
+    """
+    items: list[str] = []
+    o_level, r_level = original["level"], review["level"]
+    level_changed = o_level["code"] != r_level["code"]
+    conclusion_changed = original["conclusion"] != review["conclusion"]
+    if level_changed:
+        items.append(f"等级变化：{o_level['code']}（{o_level['name']}）→ "
+                     f"{r_level['code']}（{r_level['name']}）。")
+    else:
+        items.append(f"等级不变：{r_level['code']}（{r_level['name']}）。")
+    if conclusion_changed:
+        items.append(f"处置结论变化：{original['conclusion']} → "
+                     f"{review['conclusion']}。")
+    else:
+        items.append(f"处置结论不变：{review['conclusion']}。")
+
+    orig_lines = _by_category(original["fee_lines"])
+    fee_line_diffs: list[dict] = []
+    for cat, r in _by_category(review["fee_lines"]).items():
+        o = orig_lines.get(cat)
+        o_rate = o["fee_per_kg"] if o else None
+        o_mult = o["multiplier"] if o else None
+        o_fee = o["fee"] if o else 0.0
+        delta = _money(r["fee"] - o_fee)
+        if o and o_rate == r["fee_per_kg"] and o_mult == r["multiplier"] and not delta:
+            continue
+        fee_line_diffs.append({
+            "category": cat,
+            "original_fee_per_kg": o_rate,
+            "review_fee_per_kg": r["fee_per_kg"],
+            "original_multiplier": o_mult,
+            "review_multiplier": r["multiplier"],
+            "original_fee": o_fee,
+            "review_fee": r["fee"],
+            "delta": delta,
+        })
+        items.append(f"{cat}：费率 {o_rate} → {r['fee_per_kg']} 元/kg，"
+                     f"扣费 {o_fee:.2f} → {r['fee']:.2f} 元（{delta:+.2f}）。")
+
+    total_delta = _money(review["total_fee"] - original["total_fee"])
+    items.append(f"扣费合计 {original['total_fee']:.2f} → "
+                 f"{review['total_fee']:.2f} 元（{total_delta:+.2f}）。")
+    if (not level_changed and not conclusion_changed
+            and not fee_line_diffs and not total_delta):
+        items.append("复核结果与原判定一致。")
+    return {
+        "level_changed": level_changed,
+        "conclusion_changed": conclusion_changed,
+        "total_fee_delta": total_delta,
+        "fee_line_diffs": fee_line_diffs,
+        "items": items,
+    }
+
+
 def validate_rule(body: dict) -> list[dict]:
     """校验通过 API 提交的规则版本定义。"""
     errors: list[dict] = []
