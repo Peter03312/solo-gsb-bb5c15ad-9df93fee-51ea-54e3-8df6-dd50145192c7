@@ -120,6 +120,7 @@
 
 <script>
 let RULES = {};  // region -> active rule
+let ALL = [];    // 全部规则版本（含未启用），用于复核比对
 let CUR = null;  // 当前展示的判定单详情
 let REV = null;  // 修订模式：{root_id, base_id}
 
@@ -127,6 +128,7 @@ async function loadRules() {
   const res = await fetch('/api/rules');
   const data = await res.json();
   RULES = {};
+  ALL = data.rules;
   for (const item of data.rules) {
     if (item.status === 'active') RULES[item.region] = item.rule;
   }
@@ -263,6 +265,12 @@ async function submitForm() {
 async function renderResult(d) {
   CUR = d;
   document.getElementById('result').style.display = 'block';
+  document.getElementById('reviewBox').style.display = 'none';
+  // 复核比对：可选同区域任一已存在规则版本，默认选一个与原单不同的版本
+  const versions = ALL.filter(r => r.region === d.region).map(r => r.version);
+  const pre = versions.find(v => v !== d.rule_version) || d.rule_version;
+  document.getElementById('reviewVersion').innerHTML = versions
+    .map(v => `<option ${v === pre ? 'selected' : ''}>${v}</option>`).join('');
   const pct = (d.contamination_ratio * 100).toFixed(2) + '%';
   const vtag = d.is_current
     ? `<span class="vtag">v${d.version} · 当前有效</span>`
@@ -284,7 +292,10 @@ async function renderResult(d) {
     <div class="chain" id="chainBox"></div>
     <div class="actions">
       ${d.is_current ? '<button class="ghost" type="button" onclick="startRevision()">发起修订</button>' : ''}
+      <select id="reviewVersion" style="width:auto"></select>
+      <button class="ghost" type="button" onclick="runReview()">复核比对</button>
     </div>
+    <div class="revbox" id="reviewBox"></div>
     <h2 style="margin-top:14px">扣费明细（合计 ${d.total_fee.toFixed(2)} ${d.currency}）</h2>
     <table>
       <thead><tr><th>类别</th><th class="num">污染量 kg</th><th class="num">费率</th>
@@ -308,6 +319,45 @@ async function renderResult(d) {
           title="${it.conclusion} / ${it.created_at}">v${it.version}</a>`
     ).join('<span class="sep">→</span>') +
     ` <span class="muted">当前有效：${chain.current.conclusion}（${chain.current_id}）</span>`;
+}
+
+async function runReview() {
+  if (!CUR) return;
+  const v = document.getElementById('reviewVersion').value;
+  const box = document.getElementById('reviewBox');
+  const res = await fetch(
+    `/api/assessments/${CUR.id}/review?rule_version=${encodeURIComponent(v)}`);
+  const data = await res.json();
+  box.style.display = 'block';
+  if (!res.ok) {
+    box.innerHTML = '<b>复核被拒绝：</b><ul>' +
+      (data.errors || []).map(e =>
+        `<li><code>${e.field}</code>：${e.message}</li>`).join('') + '</ul>';
+    return;
+  }
+  const o = data.original, r = data.review, f = data.diff;
+  const diffRows = f.items.map(it =>
+    `<tr><td>${it.field}</td><td>${it.original}</td><td>${it.review}</td></tr>`
+  ).join('');
+  box.innerHTML = `
+    <b>复核比对</b>（只读试算，不改动原单、修订链与审计记录）：
+    原单 <code>${data.assessment_id}</code> 按
+    <code>${data.region}/${r.rule_version}</code> 重算
+    <table style="margin-top:8px">
+      <tr><th></th><th>原结论（${o.rule_version}）</th>
+          <th>复核试算（${r.rule_version}）</th></tr>
+      <tr><td>等级</td><td>${o.level.code} · ${o.level.name}</td>
+          <td>${r.level.code} · ${r.level.name}</td></tr>
+      <tr><td>结论</td><td>${o.conclusion}</td><td>${r.conclusion}</td></tr>
+      <tr><td>扣费合计</td><td>${o.total_fee.toFixed(2)} ${o.currency}</td>
+          <td>${r.total_fee.toFixed(2)} ${r.currency}</td></tr>
+    </table>
+    ${f.changed
+      ? `<p style="margin:8px 0 4px">差异项（扣费差额
+           ${f.total_fee_delta.toFixed(2)} ${r.currency}）：</p>
+         <table><thead><tr><th>字段</th><th>原值</th><th>复核值</th></tr></thead>
+         <tbody>${diffRows}</tbody></table>`
+      : '<p style="margin:8px 0 0">两版本计算结果一致，无差异项。</p>'}`;
 }
 
 async function loadRecent() {

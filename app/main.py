@@ -271,6 +271,67 @@ def list_revisions(aid: str, store: Store = Depends(get_store)):
             "current_id": tail_id, "current": items[-1], "items": items}
 
 
+# ---------------------------------------------------------------- 复核接口
+@app.get("/api/assessments/{aid}/review")
+def review_assessment(aid: str, rule_version: str,
+                      store: Store = Depends(get_store)):
+    """复核比对（只读）：以原单保存的批次重量与物料明细，按同区域指定规则
+    版本重新校验、计算，返回原结论与目标版本结果的差异。不产生任何写入，
+    不改动原单、修订链与审计记录。"""
+    rec = store.get_assessment(aid)
+    if not rec:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    rule = store.get_rule(rec["region"], rule_version)
+    if not rule:
+        other = next((r for r in store.list_rules()
+                      if r["version"] == rule_version), None)
+        if other:
+            return _err([{"field": "rule_version",
+                          "message": f"规则版本 {rule_version} 属于区域 "
+                                     f"{other['region']}，与判定单区域 "
+                                     f"{rec['region']} 不一致"}])
+        return _err([{"field": "rule_version",
+                      "message": f"区域 {rec['region']} 不存在规则版本 "
+                                 f"{rule_version}"}], 404)
+    materials = rec.get("materials")
+    if not materials:
+        return _err([{"field": "materials",
+                      "message": f"判定单 {aid} 缺少可重算的物料明细，无法复核"}])
+    # 目标版本计算仍执行与出具判定相同的重量、类别与污染量校验
+    errors = engine.validate_submission(rule, rec["weight_kg"], materials)
+    if errors:
+        return _err(errors)
+    result = engine.evaluate(rule, rec["weight_kg"], materials)
+    result["evidence"].insert(
+        0, f"复核试算：按规则版本 {rec['region']}/{rule_version} 重算原单 "
+           f"{aid} 保存的重量与物料明细，结果只读，不改动原单、修订链与审计记录。")
+    return {
+        "assessment_id": rec["id"],
+        "batch_no": rec["batch_no"],
+        "region": rec["region"],
+        "weight_kg": rec["weight_kg"],
+        "materials": materials,
+        "original": {
+            "rule_version": rec["rule_version"],
+            "level": rec["level"],
+            "conclusion": rec["conclusion"],
+            "total_fee": rec["total_fee"],
+            "currency": rec["currency"],
+        },
+        "review": {
+            "rule_version": rule["version"],
+            "level": result["level"],
+            "conclusion": result["conclusion"],
+            "fee_lines": result["fee_lines"],
+            "total_fee": result["total_fee"],
+            "currency": result["currency"],
+            "evidence": result["evidence"],
+        },
+        "diff": engine.review_diff(rec, result),
+        "read_only": True,
+    }
+
+
 # ---------------------------------------------------------------- 审计与导出
 @app.get("/api/audit")
 def list_audit(entity: str | None = None, limit: int = 100, offset: int = 0,

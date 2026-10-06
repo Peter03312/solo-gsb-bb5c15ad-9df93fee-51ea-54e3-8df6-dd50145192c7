@@ -329,7 +329,7 @@ class Store:
             "batch_no": row["batch_no"],
             "region": row["region"],
             "weight_kg": row["weight_kg"],
-            "materials": request["materials"],
+            "materials": request.get("materials"),
             "operator": row["operator"],
             "created_at": row["created_at"],
             "rule_version": row["rule_version"],

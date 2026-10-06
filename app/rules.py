@@ -169,6 +169,47 @@ def evaluate(rule: dict, weight_kg: float, materials: list[dict]) -> dict:
     }
 
 
+def review_diff(original: dict, review: dict) -> dict:
+    """比较原判定结果与复核试算结果，返回结构化差异项（仅用于只读比对）。
+
+    original 为判定单记录（含 level/conclusion/total_fee/fee_lines），
+    review 为 evaluate 按目标规则版本算出的结果。
+    """
+    items: list[dict] = []
+    o_level, r_level = original["level"], review["level"]
+    if o_level["code"] != r_level["code"]:
+        items.append({
+            "field": "level",
+            "original": f"{o_level['code']}（{o_level['name']}）",
+            "review": f"{r_level['code']}（{r_level['name']}）",
+        })
+    if original["conclusion"] != review["conclusion"]:
+        items.append({"field": "conclusion",
+                      "original": original["conclusion"],
+                      "review": review["conclusion"]})
+    o_fee, r_fee = original["total_fee"], review["total_fee"]
+    if o_fee != r_fee:
+        items.append({"field": "total_fee", "original": o_fee, "review": r_fee})
+    # 复核使用原单保存的同一批物料明细，扣费行按顺序一一对应
+    o_lines = original.get("fee_lines") or []
+    r_lines = review.get("fee_lines") or []
+    for i, (o_line, r_line) in enumerate(zip(o_lines, r_lines)):
+        if o_line["fee"] != r_line["fee"]:
+            items.append({
+                "field": f"fee_lines[{i}].fee",
+                "category": o_line["category"],
+                "original": o_line["fee"],
+                "review": r_line["fee"],
+            })
+    return {
+        "changed": bool(items),
+        "level_changed": o_level["code"] != r_level["code"],
+        "conclusion_changed": original["conclusion"] != review["conclusion"],
+        "total_fee_delta": _money(r_fee - o_fee),
+        "items": items,
+    }
+
+
 def validate_rule(body: dict) -> list[dict]:
     """校验通过 API 提交的规则版本定义。"""
     errors: list[dict] = []
